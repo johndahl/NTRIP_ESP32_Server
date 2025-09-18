@@ -1,0 +1,5 @@
+# Ignore build output directory
+build/
+venv/
+main/wifi_credentials.h
+main/ntrip_credentials.h
