@@ -1,3 +1,4 @@
+#include <cstdint>
 #pragma once
 // NTRIP caster (v1 SOURCE)
 static constexpr const char*  CASTER_HOST = "url.to.caster";
