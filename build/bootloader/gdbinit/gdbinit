@@ -1,0 +1,2 @@
+source /home/john/ntrip_server/build/bootloader/gdbinit/symbols
+source /home/john/ntrip_server/build/bootloader/gdbinit/connect
