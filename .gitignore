@@ -1,5 +1,8 @@
 # Ignore build output directory
 build/
 venv/
+managed_components/
+.vscode/
 main/wifi_credentials.h
 main/ntrip_credentials.h
+main/idf_component.yml

@@ -39,6 +39,8 @@
 
 #include "wifi_credentials.h"  // your WiFi credentials
 #include "ntrip_credentials.h" // your NTRIP credentials
+#include "web_server.h"
+#include "mdns.h"
 
 static const char* TAG = "NTRIP_BT_SPP";
 
@@ -501,6 +503,14 @@ static void stats_task(void*) {
     }
 }
 
+void mdns_start()
+{
+    mdns_init();
+    mdns_hostname_set("ntrip");         // -> http://ntrip.local
+    mdns_instance_name_set("ESP32 NTRIP Base");
+    mdns_service_add("Web Server", "_http", "_tcp", 80, NULL, 0);
+}
+
 // ---------- app_main ----------
 extern "C" void app_main(void) {
     s_wifi_event_group = xEventGroupCreate();
@@ -510,6 +520,13 @@ extern "C" void app_main(void) {
     wifi_init();
     uart_init_gps();
     bt_spp_init();
+    // Suppose UART1 is your CONFIG/NMEA port (adjust if you use another)
+    
+    // Start mDNS and web server (http://ntrip.local)
+    mdns_start();
+
+    // Start web server, tell it which UART to use for GNSS config
+    web_start(UART_NUM_1);
 
     // Queues
     q_rtcm = xQueueCreate(32, sizeof(RtcmMsg));

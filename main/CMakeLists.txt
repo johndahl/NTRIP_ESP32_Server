@@ -1,6 +1,7 @@
 idf_component_register(
   SRCS
   main.cpp
+  web_server.cpp
   INCLUDE_DIRS "."
   REQUIRES
     esp_event
@@ -10,6 +11,11 @@ idf_component_register(
     driver
     lwip
     bt
+    esp_http_server
+    json
+    esp_common
+    mdns
+  EMBED_TXTFILES "index.html"
 )
 set_property(TARGET ${COMPONENT_LIB} PROPERTY CXX_STANDARD 17)
 set_source_files_properties(ntrip_source.cpp PROPERTIES

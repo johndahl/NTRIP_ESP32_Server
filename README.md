@@ -9,6 +9,8 @@ The ESP is connecting to a known WiFi at start up and wait for RTCM data on the 
 
 You need to rename `wifi_credentials_template.h` and `ntrip_credentials_template.h` to `wifi_credentials.h` and `ntrip_credentials.h`, respectively, and add your credentials.
 
+The mDNS component is not shipped by default in IDF. Type `idf.py add-dependency "espressif/mdns^1.8.2"` to install this component.
+
 Use `idf.py build` to compile the project. 
 
 ### Hardware Required
