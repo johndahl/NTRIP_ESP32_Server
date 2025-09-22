@@ -6,3 +6,4 @@ managed_components/
 main/wifi_credentials.h
 main/ntrip_credentials.h
 main/idf_component.yml
+dependencies.lock

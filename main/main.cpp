@@ -526,6 +526,8 @@ extern "C" void app_main(void) {
     mdns_start();
 
     // Start web server, tell it which UART to use for GNSS config
+    //bool ok = skytraq_switch_to_binary(UART_NUM_1);
+    //if (!ok) ESP_LOGW(TAG, "Failed to switch SkyTraq to binary mode");
     web_start(UART_NUM_1);
 
     // Queues
@@ -534,6 +536,6 @@ extern "C" void app_main(void) {
     // Tasks
     xTaskCreatePinnedToCore(&gps_uart_reader_task, "gps_uart_reader", 4096, nullptr, 7, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&ntrip_task,          "ntrip_task",      4096, nullptr, 6, nullptr, tskNO_AFFINITY);
-    xTaskCreatePinnedToCore(&stats_task,          "stats_task",      2048, nullptr, 2, nullptr, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(&stats_task,          "stats_task",      4096, nullptr, 2, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&led_task,            "led_task",        2048, nullptr, 1, nullptr, tskNO_AFFINITY);
 }

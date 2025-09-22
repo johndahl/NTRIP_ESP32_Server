@@ -14,6 +14,8 @@ void web_report_position(double lat_deg, double lon_deg, double h_m, bool valid)
 // Optional: fetch what’s stored in NVS (base)
 bool web_get_base(double* lat, double* lon, double* h);
 
+bool skytraq_switch_to_binary(uart_port_t uart);
+
 #ifdef __cplusplus
 }
 #endif

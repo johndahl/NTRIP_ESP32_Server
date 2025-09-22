@@ -52,8 +52,8 @@ async function refreshGnss(){
     }
   }catch(e){}
 }
-setInterval(refreshGnss, 1000);
-refreshGnss();
+//setInterval(refreshGnss, 1000);
+//refreshGnss();
 
 document.getElementById('btnUse').onclick = async()=>{
   const r = await fetch('/api/gnss'); const j = await r.json();

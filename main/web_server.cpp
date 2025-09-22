@@ -76,10 +76,135 @@ static bool skytraq_set_base_static(uart_port_t uart, double lat_deg, double lon
     frame[k++] = cs;
     frame[k++] = 0x0D; frame[k++] = 0x0A;
 
+    // Flush RX buffer before sending
+    uart_flush_input(uart);
+
     // Write to GNSS config UART
     int written = uart_write_bytes(uart, (const char*)frame, k);
     ESP_LOGI(TAG, "Sent SkyTraq 0x22 (Set Base) %d bytes", written);
-    return (written == (int)k);
+    if (written != (int)k) return false;
+
+    // Wait for ACK (0xA0 0xA1 ... 0x83 ... 0x0D 0x0A)
+    uint8_t resp[32];
+    int len = 0;
+    const int timeout_ms = 2000; // Try longer timeout
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 20 / portTICK_PERIOD_MS);
+        if (r > 0) {
+            len += r;
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO); // Log all received bytes
+            for (int i = 0; i < len - 6; ++i) {
+                if (resp[i] == 0xA0 && resp[i+1] == 0xA1) {
+                    uint8_t id = resp[i+4];
+                    if (id == 0x83) return true;  // ACK
+                    if (id == 0x84) return false; // NACK
+                }
+            }
+        }
+        elapsed += 20;
+    }
+    ESP_LOGW(TAG, "No ACK from SkyTraq after 0x22");
+    return false;
+}
+
+// ---------- Switch SkyTraq to binary protocol ----------
+bool skytraq_switch_to_binary(uart_port_t uart) {
+    // SkyTraq protocol: <A0 A1> <00 03> <09 01 00> <CS> <0D 0A>
+    uint8_t frame[10];
+    frame[0] = 0xA0; frame[1] = 0xA1;
+    frame[2] = 0x00; frame[3] = 0x03;
+    frame[4] = 0x09; // Message ID: Set Serial Port
+    frame[5] = 0x01; // Protocol: 0x01 = Binary
+    frame[6] = 0x00; // Reserved
+    frame[7] = frame[4] ^ frame[5] ^ frame[6]; // Checksum
+    frame[8] = 0x0D; frame[9] = 0x0A;
+
+    uart_flush_input(uart);
+    int written = uart_write_bytes(uart, (const char*)frame, sizeof(frame));
+    ESP_LOGI(TAG, "Sent SkyTraq Switch to Binary (%d bytes)", written);
+    if (written != sizeof(frame)) return false;
+
+    // Wait for ACK (optional)
+    uint8_t resp[32];
+    int len = 0;
+    const int timeout_ms = 1000;
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 100 / portTICK_PERIOD_MS);
+        if (r > 0) {
+            len += r;
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO);
+            for (int i = 0; i < len - 6; ++i) {
+                if (resp[i] == 0xA0 && resp[i+1] == 0xA1) {
+                    uint8_t id = resp[i+4];
+                    if (id == 0x83) return true;  // ACK
+                    if (id == 0x84) return false; // NACK
+                }
+            }
+        }
+        elapsed += 100;
+    }
+    ESP_LOGW(TAG, "No ACK from SkyTraq after switch to binary");
+    return false;
+}
+
+// ---------- Query SkyTraq base position (Message 0x25)
+// Returns true on success, and fills lat, lon, h (height in meters)
+static bool skytraq_query_base_position(uart_port_t uart, double* lat, double* lon, double* h) {
+    // Build query frame: <A0 A1> <00 01> <23> <23> <0D 0A>
+    uint8_t frame[7];
+    frame[0] = 0xA0;
+    frame[1] = 0xA1;
+    frame[2] = 0x00;
+    frame[3] = 0x01;
+    frame[4] = 0x23; // Message ID
+    frame[5] = 0x23; // Checksum (just 0x23)
+    frame[6] = 0x0D; // End
+    frame[7] = 0x0A;
+
+    uart_flush_input(uart);
+    int written = uart_write_bytes(uart, (const char*)frame, 7);
+    ESP_LOGI(TAG, "Sent SkyTraq Query Base Position (%d bytes)", written);
+    if (written != 7) return false;
+
+    // Wait for response: <A0 A1> <PL_hi PL_lo> <0xA5> <payload> <CS> <0D 0A>
+    uint8_t resp[64];
+    int len = 0;
+    const int timeout_ms = 1000;
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 50 / portTICK_PERIOD_MS);
+        if (r > 0) {
+            len += r;
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO);
+            // Look for response frame
+            for (int i = 0; i < len - 24; ++i) {
+                if (resp[i] == 0xA0 && resp[i+1] == 0xA1 && resp[i+4] == 0xA5) {
+                    // Payload length
+                    int pl = (resp[i+2] << 8) | resp[i+3];
+                    if (pl < 21) continue; // Not enough for base position
+                    // Payload: [0]=0xA5, [1]=mode, [2-9]=lat, [10-17]=lon, [18-21]=h
+                    union { uint64_t u; double d; } u64;
+                    union { uint32_t u; float f; } u32;
+                    u64.u = 0;
+                    u32.u = 0;
+                    // Big endian decode
+                    for (int j = 0; j < 8; ++j) u64.u = (u64.u << 8) | resp[i+6+1+j];
+                    *lat = u64.d;
+                    u64.u = 0;
+                    for (int j = 0; j < 8; ++j) u64.u = (u64.u << 8) | resp[i+6+9+j];
+                    *lon = u64.d;
+                    for (int j = 0; j < 4; ++j) u32.u = (u32.u << 8) | resp[i+6+17+j];
+                    *h = u32.f;
+                    return true;
+                }
+            }
+        }
+        elapsed += 50;
+    }
+    ESP_LOGW(TAG, "No response to SkyTraq Query Base Position");
+    return false;
 }
 
 // ---------- HTTP handlers ----------
@@ -91,6 +216,18 @@ static esp_err_t handle_root(httpd_req_t* req){
 }
 
 static esp_err_t handle_get_gnss(httpd_req_t* req){
+    
+    double lat, lon, h;
+    bool ok = skytraq_query_base_position(s_cfg_uart, &lat, &lon, &h);
+    if (ok) {
+        s_lat.store(lat);
+        s_lon.store(lon);
+        s_h.store(h);
+        s_valid.store(true);
+    }
+    else {
+        s_valid.store(false);
+    }
     httpd_resp_set_type(req, "application/json");
     cJSON* j = cJSON_CreateObject();
     if (s_valid.load()){
@@ -154,7 +291,7 @@ static esp_err_t handle_post_base(httpd_req_t* req){
 
     // Push to receiver via SkyTraq 0x22 (Static)
     bool ok = skytraq_set_base_static(s_cfg_uart, lat, lon, (float)alt, save);
-    if (!ok) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "uart write fail");
+    if (!ok) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "uart write fail or no ack");
 
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
