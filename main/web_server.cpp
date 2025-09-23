@@ -10,10 +10,14 @@
 #include "cJSON.h"
 #include "driver/uart.h"
 #include "esp_check.h"
+#include "uart_comm.h"
 
 // Embedded page from CMake target_add_binary_data
-extern const char _binary_index_html_start[] asm("_binary_index_html_start");
-extern const char _binary_index_html_end[]   asm("_binary_index_html_end");
+//extern const char _binary_index_html_start[] asm("_binary_index_html_start");
+//extern const char _binary_index_html_end[]   asm("_binary_index_html_end");
+
+extern const unsigned char _binary_index_html_start[];
+extern const unsigned char _binary_index_html_end[];
 
 static const char* TAG = "web";
 static uart_port_t s_cfg_uart = UART_NUM_1; // default; overwritten by web_start
@@ -52,183 +56,102 @@ static inline void be32(uint8_t* p, uint32_t v){ p[0]=v>>24; p[1]=v>>16; p[2]=v>
 static inline void be64(uint8_t* p, uint64_t v){ for(int i=0;i<8;i++) p[i] = (v>>(56-8*i)) & 0xFF; }
 
 static bool skytraq_set_base_static(uart_port_t uart, double lat_deg, double lon_deg, float h_m, bool save_flash){
-    uint8_t payload[1 + 4 + 4 + 8 + 8 + 4 + 1] = {0};
+    uint8_t pay[1 + 1 + 4 + 4 + 8 + 8 + 4 + 1] = {0};
     size_t off = 0;
-    payload[off++] = 0x22;                  // Message ID inside payload for CS calc (spec: ID is part of payload)
-    payload[off++] = 0x02;                  // Base Position Mode = 0x02 (Static)
-    be32(&payload[off], 0x000007D0); off+=4;// Survey length (not used in static) - set 2000s as placeholder
-    be32(&payload[off], 0x0000001E); off+=4;// Std dev (not used in static) 30 m
+    pay[off++] = 0x22;                  // ID
+    pay[off++] = 0x02;                  // Static
+    be32(&pay[off], 0x000007D0); off+=4;// Survey length placeholder
+    be32(&pay[off], 0x0000001E); off+=4;// Std dev placeholder
     union { double d; uint64_t u; } u64;
-    u64.d = lat_deg; be64(&payload[off], u64.u); off+=8;
-    u64.d = lon_deg; be64(&payload[off], u64.u); off+=8;
+    u64.d = lat_deg; be64(&pay[off], u64.u); off+=8;
+    u64.d = lon_deg; be64(&pay[off], u64.u); off+=8;
     union { float f; uint32_t u; } u32;
-    u32.f = h_m; be32(&payload[off], u32.u); off+=4;
-    payload[off++] = save_flash ? 0x01 : 0x00;// Attributes: 1=SRAM+FLASH
+    u32.f = h_m; be32(&pay[off], u32.u); off+=4;
+    pay[off++] = save_flash ? 0x01 : 0x00;
 
-    const uint16_t PL = off; // payload length in bytes (includes Message ID as 1st payload byte per spec page 2-3)
-    uint8_t frame[2 + 2 + PL + 1 + 2]; // A0 A1 | PL | payload | CS | 0D 0A
-    size_t k = 0;
-    frame[k++] = 0xA0; frame[k++] = 0xA1;
-    frame[k++] = (PL >> 8) & 0xFF; frame[k++] = (PL) & 0xFF;
-    memcpy(&frame[k], payload, PL); k += PL;
-    uint8_t cs = 0;
-    for(size_t i = 0; i < PL; ++i) cs ^= payload[i];
-    frame[k++] = cs;
-    frame[k++] = 0x0D; frame[k++] = 0x0A;
-
-    // Flush RX buffer before sending
-    uart_flush_input(uart);
-
-    // Write to GNSS config UART
-    int written = uart_write_bytes(uart, (const char*)frame, k);
-    ESP_LOGI(TAG, "Sent SkyTraq 0x22 (Set Base) %d bytes", written);
-    if (written != (int)k) return false;
-
-    // Wait for ACK (0xA0 0xA1 ... 0x83 ... 0x0D 0x0A)
-    uint8_t resp[32];
-    int len = 0;
-    const int timeout_ms = 2000; // Try longer timeout
-    int elapsed = 0;
-    while (elapsed < timeout_ms) {
-        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 20 / portTICK_PERIOD_MS);
-        if (r > 0) {
-            len += r;
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO); // Log all received bytes
-            for (int i = 0; i < len - 6; ++i) {
-                if (resp[i] == 0xA0 && resp[i+1] == 0xA1) {
-                    uint8_t id = resp[i+4];
-                    if (id == 0x83) return true;  // ACK
-                    if (id == 0x84) return false; // NACK
-                }
-            }
-        }
-        elapsed += 20;
+    uint8_t rx[32]; uint16_t rxlen = sizeof(rx);
+    bool ok = uart_comm_sky_send_and_wait(pay, off,
+                                          /*expect_reply_id=*/0x83, // ACK
+                                          rx, &rxlen,
+                                          pdMS_TO_TICKS(700));
+    if (ok) {
+        ESP_LOGI(TAG, "SkyTraq Set Base Position OK");
+        return true;
     }
     ESP_LOGW(TAG, "No ACK from SkyTraq after 0x22");
     return false;
 }
 
 // ---------- Switch SkyTraq to binary protocol ----------
-bool skytraq_switch_to_binary(uart_port_t uart) {
-    // SkyTraq protocol: <A0 A1> <00 03> <09 01 00> <CS> <0D 0A>
-    uint8_t frame[10];
-    frame[0] = 0xA0; frame[1] = 0xA1;
-    frame[2] = 0x00; frame[3] = 0x03;
-    frame[4] = 0x09; // Message ID: Set Serial Port
-    frame[5] = 0x01; // Protocol: 0x01 = Binary
-    frame[6] = 0x00; // Reserved
-    frame[7] = frame[4] ^ frame[5] ^ frame[6]; // Checksum
-    frame[8] = 0x0D; frame[9] = 0x0A;
-
-    uart_flush_input(uart);
-    int written = uart_write_bytes(uart, (const char*)frame, sizeof(frame));
-    ESP_LOGI(TAG, "Sent SkyTraq Switch to Binary (%d bytes)", written);
-    if (written != sizeof(frame)) return false;
-
-    // Wait for ACK (optional)
-    uint8_t resp[32];
-    int len = 0;
-    const int timeout_ms = 1000;
-    int elapsed = 0;
-    while (elapsed < timeout_ms) {
-        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 100 / portTICK_PERIOD_MS);
-        if (r > 0) {
-            len += r;
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO);
-            for (int i = 0; i < len - 6; ++i) {
-                if (resp[i] == 0xA0 && resp[i+1] == 0xA1) {
-                    uint8_t id = resp[i+4];
-                    if (id == 0x83) return true;  // ACK
-                    if (id == 0x84) return false; // NACK
-                }
-            }
-        }
-        elapsed += 100;
-    }
-    ESP_LOGW(TAG, "No ACK from SkyTraq after switch to binary");
-    return false;
+bool skytraq_switch_to_binary(uart_port_t) {
+    uint8_t pay[3] = { 0x09, 0x01, 0x00 };      // ID + args
+    uint8_t rx[8]; uint16_t rxlen = sizeof(rx);
+    bool ok = uart_comm_sky_send_and_wait(pay, sizeof(pay), 0x83, rx, &rxlen, pdMS_TO_TICKS(500));
+    if (!ok) ESP_LOGW(TAG, "No ACK to Switch-to-Binary");
+    return ok;
 }
 
 // ---------- Query SkyTraq base position (Message 0x25)
 // Returns true on success, and fills lat, lon, h (height in meters)
-static bool skytraq_query_base_position(uart_port_t uart, double* lat, double* lon, double* h) {
-    // Build query frame: <A0 A1> <00 01> <23> <23> <0D 0A>
-    uint8_t frame[7];
-    frame[0] = 0xA0;
-    frame[1] = 0xA1;
-    frame[2] = 0x00;
-    frame[3] = 0x01;
-    frame[4] = 0x23; // Message ID
-    frame[5] = 0x23; // Checksum (just 0x23)
-    frame[6] = 0x0D; // End
-    frame[7] = 0x0A;
+static bool skytraq_query_base_position(uart_port_t, double* lat, double* lon, double* h) {
+    uint8_t pay[1] = { 0x23 };                 // request ID
+    uint8_t rx[64]; uint16_t rxlen = sizeof(rx);
 
-    uart_flush_input(uart);
-    int written = uart_write_bytes(uart, (const char*)frame, 7);
-    ESP_LOGI(TAG, "Sent SkyTraq Query Base Position (%d bytes)", written);
-    if (written != 7) return false;
+    // Expect reply payload starting with 0xA5
+    if (!uart_comm_sky_send_and_wait(pay, sizeof(pay), 0xA5, rx, &rxlen, pdMS_TO_TICKS(700)))
+        return false;
 
-    // Wait for response: <A0 A1> <PL_hi PL_lo> <0xA5> <payload> <CS> <0D 0A>
-    uint8_t resp[64];
-    int len = 0;
-    const int timeout_ms = 1000;
-    int elapsed = 0;
-    while (elapsed < timeout_ms) {
-        int r = uart_read_bytes(uart, resp + len, sizeof(resp) - len, 50 / portTICK_PERIOD_MS);
-        if (r > 0) {
-            len += r;
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, resp, len, ESP_LOG_INFO);
-            // Look for response frame
-            for (int i = 0; i < len - 24; ++i) {
-                if (resp[i] == 0xA0 && resp[i+1] == 0xA1 && resp[i+4] == 0xA5) {
-                    // Payload length
-                    int pl = (resp[i+2] << 8) | resp[i+3];
-                    if (pl < 21) continue; // Not enough for base position
-                    // Payload: [0]=0xA5, [1]=mode, [2-9]=lat, [10-17]=lon, [18-21]=h
-                    union { uint64_t u; double d; } u64;
-                    union { uint32_t u; float f; } u32;
-                    u64.u = 0;
-                    u32.u = 0;
-                    // Big endian decode
-                    for (int j = 0; j < 8; ++j) u64.u = (u64.u << 8) | resp[i+6+1+j];
-                    *lat = u64.d;
-                    u64.u = 0;
-                    for (int j = 0; j < 8; ++j) u64.u = (u64.u << 8) | resp[i+6+9+j];
-                    *lon = u64.d;
-                    for (int j = 0; j < 4; ++j) u32.u = (u32.u << 8) | resp[i+6+17+j];
-                    *h = u32.f;
-                    return true;
-                }
-            }
-        }
-        elapsed += 50;
+    // [0]=0xA5, [1]=mode, [2..9]=lat, [10..17]=lon, [18..21]=h(float)
+    if (rxlen < 1 + 1 + 8 + 8 + 4) return false;
+
+    union { uint64_t u; double d; } u64;
+    union { uint32_t u; float  f; } u32;
+
+    u64.u = 0;
+    for (int j = 0; j < 8; ++j) {
+        u64.u = (u64.u << 8) | rx[2 + j];
     }
-    ESP_LOGW(TAG, "No response to SkyTraq Query Base Position");
-    return false;
+    *lat = u64.d;
+
+    u64.u = 0;
+    for (int j = 0; j < 8; ++j) {
+        u64.u = (u64.u << 8) | rx[10 + j];
+    }
+    *lon = u64.d;
+
+    u32.u = 0;
+    for (int j = 0; j < 4; ++j) {
+        u32.u = (u32.u << 8) | rx[18 + j];
+    }
+    *h = u32.f;
+
+    return true;
 }
+
+
 
 // ---------- HTTP handlers ----------
 static esp_err_t handle_root(httpd_req_t* req){
     httpd_resp_set_type(req, "text/html");
-    const char* start = _binary_index_html_start;
-    const char* end   = _binary_index_html_end;
-    return httpd_resp_send(req, start, end - start);
+
+    const unsigned char* start = _binary_index_html_start;
+    const unsigned char* end   = _binary_index_html_end;
+    size_t len = (size_t)(end - start);
+
+    ESP_LOGI("web", "index.html len=%u", (unsigned)len);
+
+    if (len == 0) {
+        return httpd_resp_sendstr(req,
+            "<!doctype html><meta charset=utf-8>"
+            "<h3>index.html not embedded (len=0)</h3>"
+            "<p>Check EMBED_TXTFILES and symbol names.</p>");
+    }
+    return httpd_resp_send(req, (const char*)start, len);
 }
 
 static esp_err_t handle_get_gnss(httpd_req_t* req){
-    
-    double lat, lon, h;
-    bool ok = skytraq_query_base_position(s_cfg_uart, &lat, &lon, &h);
-    if (ok) {
-        s_lat.store(lat);
-        s_lon.store(lon);
-        s_h.store(h);
-        s_valid.store(true);
-    }
-    else {
-        s_valid.store(false);
-    }
     httpd_resp_set_type(req, "application/json");
+
     cJSON* j = cJSON_CreateObject();
     if (s_valid.load()){
         cJSON_AddBoolToObject(j, "valid", true);
@@ -238,6 +161,7 @@ static esp_err_t handle_get_gnss(httpd_req_t* req){
     } else {
         cJSON_AddBoolToObject(j, "valid", false);
     }
+
     char* out = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     esp_err_t r = httpd_resp_sendstr(req, out);
@@ -296,6 +220,10 @@ static esp_err_t handle_post_base(httpd_req_t* req){
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static esp_err_t handle_ping(httpd_req_t* req) {
+    return httpd_resp_sendstr(req, "ok");
+}
+
 // ---------- Public API ----------
 void web_report_position(double lat, double lon, double h, bool valid){
     s_lat.store(lat); s_lon.store(lon); s_h.store(h); s_valid.store(valid);
@@ -306,6 +234,11 @@ void web_start(uart_port_t cfg_uart){
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;                  // change if needed
+    cfg.stack_size = 8192;          // bump for cJSON/NVS
+    cfg.lru_purge_enable = true;    // drop oldest session if out of sockets
+    cfg.max_open_sockets = 4;       // be explicit
+    cfg.recv_wait_timeout = 5;
+    cfg.send_wait_timeout = 5;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
 
     httpd_handle_t srv = nullptr;
@@ -315,10 +248,12 @@ void web_start(uart_port_t cfg_uart){
     httpd_uri_t gnss = { .uri="/api/gnss", .method=HTTP_GET, .handler=handle_get_gnss, .user_ctx=nullptr };
     httpd_uri_t getb = { .uri="/api/base", .method=HTTP_GET, .handler=handle_get_base, .user_ctx=nullptr };
     httpd_uri_t postb= { .uri="/api/base", .method=HTTP_POST,.handler=handle_post_base,.user_ctx=nullptr };
+    httpd_uri_t ping = { .uri="/ping", .method=HTTP_GET, .handler=handle_ping, .user_ctx=nullptr };
     httpd_register_uri_handler(srv, &root);
     httpd_register_uri_handler(srv, &gnss);
     httpd_register_uri_handler(srv, &getb);
     httpd_register_uri_handler(srv, &postb);
+    httpd_register_uri_handler(srv, &ping);
 
     ESP_LOGI(TAG, "Web UI on http://<device-ip>/");
 }

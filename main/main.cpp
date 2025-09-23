@@ -41,6 +41,8 @@
 #include "ntrip_credentials.h" // your NTRIP credentials
 #include "web_server.h"
 #include "mdns.h"
+#include "uart_comm.h"
+#include "gps_base_getter.h"
 
 static const char* TAG = "NTRIP_BT_SPP";
 
@@ -343,7 +345,7 @@ struct RtcmMsg {
     uint16_t len;
     uint8_t  data[1200];  // RTCM3 max ~1029; padded
 };
-static QueueHandle_t q_rtcm = nullptr;
+//static QueueHandle_t q_rtcm = nullptr;
 
 // CRC-24Q (poly 0x1864CFB, init 0)
 static uint32_t crc24q(const uint8_t* data, size_t len) {
@@ -363,96 +365,11 @@ static uint32_t crc24q(const uint8_t* data, size_t len) {
 static SemaphoreHandle_t stats_mutex;
 static uint32_t stat_rtcm_ok = 0, stat_rtcm_bytes = 0;
 
-// GPS UART reader: mirror to SPP, capture GGA, extract RTCM3 (CRC-checked) → q_rtcm
-static void gps_uart_reader_task(void*) {
-    std::vector<uint8_t> rx(1024);
-
-    // NMEA line capture
-    std::string line; line.reserve(128);
-
-    // RTCM3 extractor state
-    enum class RState { SYNC, HDR1, HDR2, PAYLOAD };
-    RState st = RState::SYNC;
-    uint8_t hdr1 = 0, hdr2 = 0;
-    int payload_left = 0; // payload + 3 CRC bytes
-    RtcmMsg cur{};
-
-    for (;;) {
-        int got = uart_read_bytes(UART_GPS, rx.data(), rx.size(), pdMS_TO_TICKS(UART_READ_TO_MS));
-        if (got <= 0) continue;
-
-        // 1) Mirror raw bytes to SPP
-        spp_write_bytes(rx.data(), got);
-
-        // 2) NMEA GGA capture
-        for (int i = 0; i < got; ++i) {
-            unsigned char uc = rx[i];
-            char c = (char)uc;
-            if (c == '\n') {
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-                if (!line.empty() && line.front() == '$') {
-                    if (line.size() >= 6 && line[3] == 'G' && line[4] == 'G' && line[5] == 'A') {
-                        xSemaphoreTake(gga_mutex, portMAX_DELAY);
-                        last_gga = line; // no CRLF
-                        xSemaphoreGive(gga_mutex);
-                    }
-                }
-                line.clear();
-            } else if ((uc >= 0x20 && uc <= 0x7E) || c == '\r' || c == '\t') {
-                if (line.size() < 255) line.push_back(c);
-            } else {
-                if (!line.empty()) line.clear();
-            }
-        }
-
-        // 3) Extract RTCM3 and enqueue ONLY if CRC is OK
-        for (int i = 0; i < got; ++i) {
-            uint8_t b = rx[i];
-            switch (st) {
-            case RState::SYNC:
-                if (b == 0xD3) { cur.len = 0; cur.data[cur.len++] = b; st = RState::HDR1; }
-                break;
-            case RState::HDR1:
-                hdr1 = b; cur.data[cur.len++] = b; st = RState::HDR2; break;
-            case RState::HDR2: {
-                hdr2 = b; cur.data[cur.len++] = b;
-                int len10 = ((int)(hdr1 & 0x03) << 8) | hdr2;
-                if (len10 < 0 || len10 > 1023) { st = RState::SYNC; break; }
-                payload_left = len10 + 3; // payload + CRC
-                st = RState::PAYLOAD;
-                break;
-            }
-            case RState::PAYLOAD: {
-                cur.data[cur.len++] = b;
-                if (--payload_left == 0) {
-                    if (cur.len >= 6) {
-                        uint32_t calc = crc24q(cur.data, cur.len - 3);
-                        uint32_t gotCrc = ((uint32_t)cur.data[cur.len-3] << 16) |
-                                          ((uint32_t)cur.data[cur.len-2] << 8)  |
-                                           (uint32_t)cur.data[cur.len-1];
-                        if (calc == gotCrc) {
-                            RtcmMsg m{};
-                            m.len = cur.len;
-                            memcpy(m.data, cur.data, cur.len);
-                            if (q_rtcm) xQueueSend(q_rtcm, &m, 0);
-                            xSemaphoreTake(stats_mutex, portMAX_DELAY);
-                            stat_rtcm_ok++;
-                            stat_rtcm_bytes += cur.len;
-                            xSemaphoreGive(stats_mutex);
-                        }
-                    }
-                    st = RState::SYNC;
-                }
-                break;
-            }
-            } // switch
-        }     // for bytes
-    }         // forever
-}
 
 // NTRIP sender: connects, SOURCE handshake, sends RTCM frames from q_rtcm
 static void ntrip_task(void*) {
     RtcmMsg m{};
+    QueueHandle_t q_rtcm = uart_comm_get_rtcm_queue();
 
     for (;;) {
         // Wait for Wi-Fi
@@ -502,6 +419,17 @@ static void stats_task(void*) {
                  d_ok, d_ok / 5.0f, d_b, (unsigned)(d_b*8/5));
     }
 }
+static void gps_raw_to_spp_task(void*) {
+    StreamBufferHandle_t s = uart_comm_get_raw_stream();
+    uint8_t buf[512];
+    for (;;) {
+        // block until some raw data arrives, then forward
+        size_t n = xStreamBufferReceive(s, buf, sizeof(buf), portMAX_DELAY);
+        if (n > 0) {
+            spp_write_bytes(buf, n);
+        }
+    }
+}
 
 void mdns_start()
 {
@@ -518,8 +446,15 @@ extern "C" void app_main(void) {
     stats_mutex = xSemaphoreCreateMutex();
 
     wifi_init();
-    uart_init_gps();
-    bt_spp_init();
+    //uart_init_gps();
+    uart_comm_start(UART_NUM_1, 115200, /*TX*/26, /*RX*/27);
+
+    // get queues
+    auto q_rtcm = uart_comm_get_rtcm_queue();
+    auto q_nmea = uart_comm_get_nmea_queue();
+
+    //bt_spp_init();
+    
     // Suppose UART1 is your CONFIG/NMEA port (adjust if you use another)
     
     // Start mDNS and web server (http://ntrip.local)
@@ -529,12 +464,14 @@ extern "C" void app_main(void) {
     //bool ok = skytraq_switch_to_binary(UART_NUM_1);
     //if (!ok) ESP_LOGW(TAG, "Failed to switch SkyTraq to binary mode");
     web_start(UART_NUM_1);
+    gps_base_getter_start(UART_NUM_1, 1000); // 1 Hz polling
 
     // Queues
-    q_rtcm = xQueueCreate(32, sizeof(RtcmMsg));
+    //q_rtcm = xQueueCreate(32, sizeof(RtcmMsg));
 
     // Tasks
-    xTaskCreatePinnedToCore(&gps_uart_reader_task, "gps_uart_reader", 4096, nullptr, 7, nullptr, tskNO_AFFINITY);
+    //xTaskCreatePinnedToCore(&gps_uart_reader_task, "gps_uart_reader", 4096, nullptr, 7, nullptr, tskNO_AFFINITY);
+    //xTaskCreatePinnedToCore(gps_raw_to_spp_task, "raw_to_spp", 4096, nullptr, 5, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&ntrip_task,          "ntrip_task",      4096, nullptr, 6, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&stats_task,          "stats_task",      4096, nullptr, 2, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&led_task,            "led_task",        2048, nullptr, 1, nullptr, tskNO_AFFINITY);
