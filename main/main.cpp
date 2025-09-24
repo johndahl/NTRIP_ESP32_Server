@@ -345,7 +345,6 @@ struct RtcmMsg {
     uint16_t len;
     uint8_t  data[1200];  // RTCM3 max ~1029; padded
 };
-//static QueueHandle_t q_rtcm = nullptr;
 
 // CRC-24Q (poly 0x1864CFB, init 0)
 static uint32_t crc24q(const uint8_t* data, size_t len) {
@@ -446,32 +445,25 @@ extern "C" void app_main(void) {
     stats_mutex = xSemaphoreCreateMutex();
 
     wifi_init();
-    //uart_init_gps();
+    //bt_spp_init();
     uart_comm_start(UART_NUM_1, 115200, /*TX*/26, /*RX*/27);
 
     // get queues
     auto q_rtcm = uart_comm_get_rtcm_queue();
     auto q_nmea = uart_comm_get_nmea_queue();
 
-    //bt_spp_init();
     
-    // Suppose UART1 is your CONFIG/NMEA port (adjust if you use another)
     
     // Start mDNS and web server (http://ntrip.local)
     mdns_start();
 
     // Start web server, tell it which UART to use for GNSS config
-    //bool ok = skytraq_switch_to_binary(UART_NUM_1);
-    //if (!ok) ESP_LOGW(TAG, "Failed to switch SkyTraq to binary mode");
     web_start(UART_NUM_1);
     gps_base_getter_start(UART_NUM_1, 1000); // 1 Hz polling
 
-    // Queues
-    //q_rtcm = xQueueCreate(32, sizeof(RtcmMsg));
-
     // Tasks
     //xTaskCreatePinnedToCore(&gps_uart_reader_task, "gps_uart_reader", 4096, nullptr, 7, nullptr, tskNO_AFFINITY);
-    //xTaskCreatePinnedToCore(gps_raw_to_spp_task, "raw_to_spp", 4096, nullptr, 5, nullptr, tskNO_AFFINITY);
+    //xTaskCreatePinnedToCore(&gps_raw_to_spp_task, "raw_to_spp",      4096, nullptr, 5, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&ntrip_task,          "ntrip_task",      4096, nullptr, 6, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&stats_task,          "stats_task",      4096, nullptr, 2, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(&led_task,            "led_task",        2048, nullptr, 1, nullptr, tskNO_AFFINITY);

@@ -82,6 +82,33 @@ static bool skytraq_set_base_static(uart_port_t uart, double lat_deg, double lon
     return false;
 }
 
+// Survey-In mode using SkyTraq 0x22
+static bool skytraq_set_base_survey(uart_port_t uart, uint32_t seconds, uint32_t stddev_m, bool save_flash){
+    // Payload layout you already use for 0x22:
+    // [0]=0x22, [1]=mode, [2..5]=survey_len (u32), [6..9]=stddev_m (u32),
+    // [10..17]=lat(double), [18..25]=lon(double), [26..29]=h(float), [30]=attr
+    uint8_t pay[1 + 1 + 4 + 4 + 8 + 8 + 4 + 1] = {0};
+    size_t off = 0;
+    pay[off++] = 0x22;               // ID
+    pay[off++] = 0x00;               // mode: 0x00 = Survey
+    // big-endian helpers
+    auto be32 = [](uint8_t* p, uint32_t v){ p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; };
+    auto be64 = [](uint8_t* p, uint64_t v){ for(int i=0;i<8;i++) p[i] = (v>>(56-8*i)) & 0xFF; };
+
+    be32(&pay[off], seconds); off+=4;
+    be32(&pay[off], stddev_m); off+=4;
+    // lat/lon/h ignored in survey mode → write zeros
+    union { double d; uint64_t u; } u64; u64.d = 0.0; be64(&pay[off], u64.u); off+=8;
+    be64(&pay[off], u64.u); off+=8;
+    union { float f; uint32_t u; } u32; u32.f = 0.0f; be32(&pay[off], u32.u); off+=4;
+
+    pay[off++] = save_flash ? 0x01 : 0x00;  // SRAM+FLASH
+
+    uint8_t rx[32]; uint16_t rxlen = sizeof(rx);
+    bool ok = uart_comm_sky_send_and_wait(pay, off, /*expect_reply_id=*/0x83, rx, &rxlen, pdMS_TO_TICKS(700));
+    return ok;
+}
+
 // ---------- Switch SkyTraq to binary protocol ----------
 bool skytraq_switch_to_binary(uart_port_t) {
     uint8_t pay[3] = { 0x09, 0x01, 0x00 };      // ID + args
@@ -147,6 +174,33 @@ static esp_err_t handle_root(httpd_req_t* req){
             "<p>Check EMBED_TXTFILES and symbol names.</p>");
     }
     return httpd_resp_send(req, (const char*)start, len);
+}
+
+static esp_err_t handle_post_survey(httpd_req_t* req){
+    // read JSON body
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if (len <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+    buf[len] = 0;
+
+    cJSON* j = cJSON_Parse(buf);
+    if (!j) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+
+    cJSON* jsec = cJSON_GetObjectItem(j, "seconds");
+    cJSON* jstd = cJSON_GetObjectItem(j, "stddev");
+    cJSON* js   = cJSON_GetObjectItem(j, "saveToFlash");
+
+    uint32_t seconds = (cJSON_IsNumber(jsec) && jsec->valuedouble > 0) ? (uint32_t)jsec->valuedouble : 60;
+    uint32_t stddev  = (cJSON_IsNumber(jstd) && jstd->valuedouble >= 0) ? (uint32_t)jstd->valuedouble : 300;
+    bool save = true;
+    if (js && cJSON_IsBool(js)) save = cJSON_IsTrue(js);
+
+    cJSON_Delete(j);
+
+    bool ok = skytraq_set_base_survey(s_cfg_uart, seconds, stddev, save);
+    if (!ok) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ACK from GNSS");
+
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t handle_get_gnss(httpd_req_t* req){
@@ -249,11 +303,13 @@ void web_start(uart_port_t cfg_uart){
     httpd_uri_t getb = { .uri="/api/base", .method=HTTP_GET, .handler=handle_get_base, .user_ctx=nullptr };
     httpd_uri_t postb= { .uri="/api/base", .method=HTTP_POST,.handler=handle_post_base,.user_ctx=nullptr };
     httpd_uri_t ping = { .uri="/ping", .method=HTTP_GET, .handler=handle_ping, .user_ctx=nullptr };
+    httpd_uri_t survey = { .uri="/api/survey", .method=HTTP_POST, .handler=handle_post_survey, .user_ctx=nullptr };
     httpd_register_uri_handler(srv, &root);
     httpd_register_uri_handler(srv, &gnss);
     httpd_register_uri_handler(srv, &getb);
     httpd_register_uri_handler(srv, &postb);
     httpd_register_uri_handler(srv, &ping);
+    httpd_register_uri_handler(srv, &survey);
 
     ESP_LOGI(TAG, "Web UI on http://<device-ip>/");
 }
